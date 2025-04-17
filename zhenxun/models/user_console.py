@@ -26,7 +26,7 @@ class UserConsole(Model):
     create_time = fields.DatetimeField(auto_now_add=True, description="创建时间")
     """创建时间"""
 
-    class Meta:
+    class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "user_console"
         table_description = "用户数据表"
 
@@ -174,6 +174,8 @@ class UserConsole(Model):
         if goods_uuid not in user.props or user.props[goods_uuid] < num:
             raise GoodsNotFound("未找到商品或道具数量不足...")
         user.props[goods_uuid] -= num
+        if user.props[goods_uuid] <= 0:
+            del user.props[goods_uuid]
         await user.save(update_fields=["props"])
 
     @classmethod

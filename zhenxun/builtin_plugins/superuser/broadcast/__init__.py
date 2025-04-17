@@ -5,6 +5,7 @@ from nonebot.adapters import Bot
 from nonebot.params import Command
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
+from nonebot.rule import to_me
 from nonebot_plugin_alconna import Text as alcText
 from nonebot_plugin_alconna import UniMsg
 from nonebot_plugin_session import EventSession
@@ -38,10 +39,12 @@ __plugin_meta__ = PluginMetadata(
             )
         ],
         tasks=[Task(module="broadcast", name="广播")],
-    ).dict(),
+    ).to_dict(),
 )
 
-_matcher = on_command("广播", priority=1, permission=SUPERUSER, block=True)
+_matcher = on_command(
+    "广播", priority=1, permission=SUPERUSER, block=True, rule=to_me()
+)
 
 
 @_matcher.handle()

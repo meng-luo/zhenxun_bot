@@ -44,39 +44,57 @@ class PluginInfo(Model):
     """插件限制"""
     admin_level = fields.IntField(default=0, null=True, description="调用所需权限等级")
     """调用所需权限等级"""
+    ignore_prompt = fields.BooleanField(default=False, description="是否忽略提示")
+    """是否忽略阻断提示"""
     is_delete = fields.BooleanField(default=False, description="是否删除")
     """是否删除"""
     parent = fields.CharField(max_length=255, null=True, description="父插件")
     """父插件"""
     is_show = fields.BooleanField(default=True, description="是否显示在帮助中")
     """是否显示在帮助中"""
+    impression = fields.FloatField(default=0, description="插件好感度限制")
+    """插件好感度限制"""
 
-    class Meta:  # type: ignore
+    class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "plugin_info"
         table_description = "插件基本信息"
 
     @classmethod
-    async def get_plugin(cls, load_status: bool = True, **kwargs) -> Self | None:
+    async def get_plugin(
+        cls, load_status: bool = True, filter_parent: bool = True, **kwargs
+    ) -> Self | None:
         """获取插件列表
 
         参数:
             load_status: 加载状态.
+            filter_parent: 过滤父组件
 
         返回:
             Self | None: 插件
         """
+        if filter_parent:
+            return await cls.get_or_none(
+                load_status=load_status, plugin_type__not=PluginType.PARENT, **kwargs
+            )
         return await cls.get_or_none(load_status=load_status, **kwargs)
 
     @classmethod
-    async def get_plugins(cls, load_status: bool = True, **kwargs) -> list[Self]:
+    async def get_plugins(
+        cls, load_status: bool = True, filter_parent: bool = True, **kwargs
+    ) -> list[Self]:
         """获取插件列表
 
         参数:
             load_status: 加载状态.
+            filter_parent: 过滤父组件
 
         返回:
             list[Self]: 插件列表
         """
+        if filter_parent:
+            return await cls.filter(
+                load_status=load_status, plugin_type__not=PluginType.PARENT, **kwargs
+            ).all()
         return await cls.filter(load_status=load_status, **kwargs).all()
 
     @classmethod
@@ -84,4 +102,6 @@ class PluginInfo(Model):
         return [
             "ALTER TABLE plugin_info ADD COLUMN parent character varying(255);",
             "ALTER TABLE plugin_info ADD COLUMN is_show boolean DEFAULT true;",
+            "ALTER TABLE plugin_info ADD COLUMN ignore_prompt boolean DEFAULT false;",
+            "ALTER TABLE plugin_info ADD COLUMN impression float DEFAULT 0;",
         ]

@@ -2,19 +2,11 @@ from datetime import datetime
 import uuid
 
 import nonebot
-from nonebot import require
 from nonebot.adapters import Bot
 from nonebot.drivers import Driver
 from tortoise import Tortoise
 from tortoise.exceptions import OperationalError
 import ujson as json
-
-require("nonebot_plugin_apscheduler")
-require("nonebot_plugin_alconna")
-require("nonebot_plugin_session")
-require("nonebot_plugin_userinfo")
-require("nonebot_plugin_htmlrender")
-# require("nonebot_plugin_uninfo")
 
 from zhenxun.models.bot_connect_log import BotConnectLog
 from zhenxun.models.bot_console import BotConsole
@@ -24,6 +16,7 @@ from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.log import logger
 from zhenxun.utils.decorator.shop import shop_register
+from zhenxun.utils.manager.resource_manager import ResourceManager
 from zhenxun.utils.platform import PlatformUtils
 
 driver: Driver = nonebot.get_driver()
@@ -44,9 +37,15 @@ async def _(bot: Bot):
 @driver.on_bot_disconnect
 async def _(bot: Bot):
     logger.debug(f"Bot: {bot.self_id} 断开连接...")
-    await BotConnectLog.create(
-        bot_id=bot.self_id, platform=bot.adapter, connect_time=datetime.now(), type=0
-    )
+    try:
+        await BotConnectLog.create(
+            bot_id=bot.self_id,
+            platform=bot.adapter,
+            connect_time=datetime.now(),
+            type=0,
+        )
+    except Exception as e:
+        logger.warning(f"记录bot: {bot.self_id} 断开连接失败", e=e)
 
 
 SIGN_SQL = """
@@ -73,6 +72,7 @@ from public.bag_users t1
 
 @driver.on_startup
 async def _():
+    await ResourceManager.init_resources()
     """签到与用户的数据迁移"""
     if goods_list := await GoodsInfo.filter(uuid__isnull=True).all():
         for goods in goods_list:

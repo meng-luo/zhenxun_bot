@@ -1,12 +1,20 @@
+import contextlib
 from typing import Protocol
 
 from aiocache import cached
-from pydantic import BaseModel
+from nonebot.compat import model_dump
+from pydantic import BaseModel, Field
 from strenum import StrEnum
 
 from zhenxun.utils.http_utils import AsyncHttpx
 
-from .const import CACHED_API_TTL, GIT_API_TREES_FORMAT, JSD_PACKAGE_API_FORMAT
+from .const import (
+    CACHED_API_TTL,
+    GIT_API_COMMIT_FORMAT,
+    GIT_API_PROXY_COMMIT_FORMAT,
+    GIT_API_TREES_FORMAT,
+    JSD_PACKAGE_API_FORMAT,
+)
 from .func import (
     get_fastest_archive_formats,
     get_fastest_raw_formats,
@@ -36,26 +44,49 @@ class RepoInfo(BaseModel):
     async def get_raw_download_urls(self, path: str) -> list[str]:
         url_formats = await get_fastest_raw_formats()
         return [
-            url_format.format(**self.dict(), path=path) for url_format in url_formats
+            url_format.format(**self.to_dict(), path=path) for url_format in url_formats
         ]
 
     async def get_archive_download_urls(self) -> list[str]:
         url_formats = await get_fastest_archive_formats()
-        return [url_format.format(**self.dict()) for url_format in url_formats]
+        return [url_format.format(**self.to_dict()) for url_format in url_formats]
 
     async def get_release_source_download_urls_tgz(self, version: str) -> list[str]:
         url_formats = await get_fastest_release_source_formats()
         return [
-            url_format.format(**self.dict(), version=version, compress="tar.gz")
+            url_format.format(**self.to_dict(), version=version, compress="tar.gz")
             for url_format in url_formats
         ]
 
     async def get_release_source_download_urls_zip(self, version: str) -> list[str]:
         url_formats = await get_fastest_release_source_formats()
         return [
-            url_format.format(**self.dict(), version=version, compress="zip")
+            url_format.format(**self.to_dict(), version=version, compress="zip")
             for url_format in url_formats
         ]
+
+    async def update_repo_commit(self):
+        with contextlib.suppress(Exception):
+            newest_commit = await self.get_newest_commit(
+                self.owner, self.repo, self.branch
+            )
+            if newest_commit:
+                self.branch = newest_commit
+                return True
+        return False
+
+    def to_dict(self, **kwargs):
+        return model_dump(self, **kwargs)
+
+    @classmethod
+    @cached(ttl=CACHED_API_TTL)
+    async def get_newest_commit(cls, owner: str, repo: str, branch: str) -> str:
+        commit_url = GIT_API_COMMIT_FORMAT.format(owner=owner, repo=repo, branch=branch)
+        commit_url_proxy = GIT_API_PROXY_COMMIT_FORMAT.format(
+            owner=owner, repo=repo, branch=branch
+        )
+        resp = await AsyncHttpx().get([commit_url, commit_url_proxy])
+        return "" if resp.status_code != 200 else resp.json()["sha"]
 
 
 class APIStrategy(Protocol):
@@ -95,7 +126,7 @@ class FileInfo(BaseModel):
 
     type: FileType
     name: str
-    files: list["FileInfo"] = []
+    files: list["FileInfo"] = Field(default_factory=list)
 
 
 class JsdelivrStrategy:
@@ -106,8 +137,8 @@ class JsdelivrStrategy:
     def get_file_paths(self, module_path: str, is_dir: bool = True) -> list[str]:
         """获取文件路径"""
         paths = module_path.split("/")
-        filename = "" if is_dir else paths[-1]
-        paths = paths if is_dir else paths[:-1]
+        filename = "" if is_dir and module_path else paths[-1]
+        paths = paths if is_dir and module_path else paths[:-1]
         cur_file = self.body
         for path in paths:  # 导航到正确的目录
             cur_file = next(
@@ -141,7 +172,8 @@ class JsdelivrStrategy:
                 ]
             return []
 
-        return collect_files(cur_file, "/".join(paths), filename)
+        files = collect_files(cur_file, "/".join(paths), filename)
+        return files if module_path else [f[1:] for f in files]
 
     @classmethod
     @cached(ttl=CACHED_API_TTL)
@@ -183,7 +215,7 @@ class Tree(BaseModel):
     mode: str
     type: TreeType
     sha: str
-    size: int | None
+    size: int | None = None
     url: str
 
 
@@ -208,7 +240,7 @@ class GitHubStrategy:
             for file in tree_info.tree
             if file.type == TreeType.FILE
             and file.path.startswith(module_path)
-            and (not is_dir or file.path[len(module_path)] == "/")
+            and (not is_dir or file.path[len(module_path)] == "/" or not module_path)
         ]
 
     @classmethod

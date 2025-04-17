@@ -16,6 +16,7 @@ from zhenxun.models.sign_log import SignLog
 from zhenxun.models.sign_user import SignUser
 from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.image_utils import BuildImage
+from zhenxun.utils.platform import PlatformUtils
 
 from .config import (
     SIGN_BACKGROUND_PATH,
@@ -57,7 +58,7 @@ LG_MESSAGE = [
 async def init_image():
     SIGN_RESOURCE_PATH.mkdir(parents=True, exist_ok=True)
     SIGN_TODAY_CARD_PATH.mkdir(exist_ok=True, parents=True)
-    await generate_progress_bar_pic()
+    # await generate_progress_bar_pic()
     clear_sign_data_pic()
 
 
@@ -86,6 +87,7 @@ async def get_card(
     返回:
         Path: 卡片路径
     """
+    await generate_progress_bar_pic()
     user_id = user.user_id
     date = datetime.now().date()
     _type = "view" if is_card_view else "sign"
@@ -296,6 +298,10 @@ async def generate_progress_bar_pic():
     """
     初始化进度条图片
     """
+    bar_white_file = SIGN_RESOURCE_PATH / "bar_white.png"
+    if bar_white_file.exists():
+        return
+
     bg_2 = (254, 1, 254)
     bg_1 = (0, 245, 246)
 
@@ -335,7 +341,7 @@ async def generate_progress_bar_pic():
     await bk.paste(img_y, (0, 0))
     await bk.paste(A, (25, 0))
     await bk.paste(img_x, (975, 0))
-    await bk.save(SIGN_RESOURCE_PATH / "bar_white.png")
+    await bk.save(bar_white_file)
 
 
 def get_level_and_next_impression(impression: float) -> tuple[str, int | float, int]:
@@ -425,7 +431,9 @@ async def _generate_html_card(
     )
     now = datetime.now()
     data = {
-        "ava_url": session.user.avatar,
+        "ava_url": PlatformUtils.get_user_avatar_url(
+            user.user_id, PlatformUtils.get_platform(session), session.self_id
+        ),
         "name": nickname,
         "uid": uid,
         "sign_count": f"{user.sign_count}",

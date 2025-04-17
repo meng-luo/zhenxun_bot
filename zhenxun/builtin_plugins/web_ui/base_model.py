@@ -1,11 +1,17 @@
 from datetime import datetime
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, validator
+from nonebot.compat import PYDANTIC_V2
+from pydantic import BaseModel
 
 T = TypeVar("T")
 
 RT = TypeVar("RT")
+
+if PYDANTIC_V2:
+    from pydantic import field_validator as validator_decorator
+else:
+    from pydantic import validator as validator_decorator
 
 
 class User(BaseModel):
@@ -18,7 +24,7 @@ class Token(BaseModel):
     token_type: str
 
 
-class Result(Generic[RT], BaseModel):
+class Result(BaseModel, Generic[RT]):
     """
     总体返回
     """
@@ -31,7 +37,7 @@ class Result(Generic[RT], BaseModel):
     """info"""
     warning: str | None = None
     """警告信息"""
-    data: RT = None
+    data: RT | None = None
     """返回数据"""
 
     @classmethod
@@ -58,16 +64,16 @@ class QueryModel(BaseModel, Generic[T]):
     """页数"""
     size: int
     """每页数量"""
-    data: T
+    data: T | None = None
     """携带数据"""
 
-    @validator("index")
+    @validator_decorator("index")
     def index_validator(cls, index):
         if index < 1:
             raise ValueError("查询下标小于1...")
         return index
 
-    @validator("size")
+    @validator_decorator("size")
     def size_validator(cls, size):
         if size < 1:
             raise ValueError("每页数量小于1...")

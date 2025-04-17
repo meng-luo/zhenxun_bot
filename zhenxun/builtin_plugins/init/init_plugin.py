@@ -34,7 +34,6 @@ async def _handle_setting(
     plugin: Plugin,
     plugin_list: list[PluginInfo],
     limit_list: list[PluginLimit],
-    task_list: list[tuple[bool, TaskInfo]],
 ):
     """处理插件设置
 
@@ -73,7 +72,10 @@ async def _handle_setting(
             cost_gold=setting.cost_gold,
             plugin_type=extra_data.plugin_type,
             admin_level=extra_data.admin_level,
+            is_show=extra_data.is_show,
+            ignore_prompt=extra_data.ignore_prompt,
             parent=(plugin.parent_plugin.module_name if plugin.parent_plugin else None),
+            impression=setting.impression,
         )
     )
     if extra_data.limits:
@@ -91,20 +93,6 @@ async def _handle_setting(
             )
             for limit in extra_data.limits
         )
-    if extra_data.tasks:
-        task_list.extend(
-            (
-                task.create_status,
-                TaskInfo(
-                    module=task.module,
-                    name=task.name,
-                    status=task.status,
-                    run_time=task.run_time,
-                    default_status=task.default_status,
-                ),
-            )
-            for task in extra_data.tasks
-        )
 
 
 @driver.on_startup
@@ -114,14 +102,13 @@ async def _():
     """
     plugin_list: list[PluginInfo] = []
     limit_list: list[PluginLimit] = []
-    task_list = []
     module2id = {}
     load_plugin = []
     if module_list := await PluginInfo.all().values("id", "module_path"):
         module2id = {m["module_path"]: m["id"] for m in module_list}
     for plugin in get_loaded_plugins():
-        load_plugin.append(plugin.name)
-        await _handle_setting(plugin, plugin_list, limit_list, task_list)
+        load_plugin.append(plugin.module_name)
+        await _handle_setting(plugin, plugin_list, limit_list)
     create_list = []
     update_list = []
     for plugin in plugin_list:
@@ -170,36 +157,9 @@ async def _():
     #                     limit_create.append(limit)
     #     if limit_create:
     #         await PluginLimit.bulk_create(limit_create, 10)
-    if task_list:
-        module_dict = {
-            t[1]: t[0] for t in await TaskInfo.all().values_list("id", "module")
-        }
-        create_list = []
-        update_list = []
-        for status, task in task_list:
-            if task.module not in module_dict:
-                create_list.append((status, task))
-            else:
-                task.id = module_dict[task.module]
-                update_list.append(task)
-        if create_list:
-            _create_list = [t[1] for t in create_list]
-            await TaskInfo.bulk_create(_create_list, 10)
-            if block := [t[1].module for t in create_list if not t[0]]:
-                block_task = ",".join(block) + ","
-                if group_list := await GroupConsole.all():
-                    for group in group_list:
-                        group.block_task += block_task
-                    await GroupConsole.bulk_update(group_list, ["block_task"], 10)
-        if update_list:
-            await TaskInfo.bulk_update(
-                update_list,
-                ["run_time", "name"],
-                10,
-            )
     await data_migration()
-    await PluginInfo.filter(module__in=load_plugin).update(load_status=True)
-    await PluginInfo.filter(module__not_in=load_plugin).update(load_status=False)
+    await PluginInfo.filter(module_path__in=load_plugin).update(load_status=True)
+    await PluginInfo.filter(module_path__not_in=load_plugin).update(load_status=False)
     manager.init()
     if limit_list:
         for limit in limit_list:

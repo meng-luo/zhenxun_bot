@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from nonebot import require
 
 from zhenxun.models.plugin_info import PluginInfo
+from zhenxun.services.log import logger
 
 from ....base_model import Result
 from ....utils import authentication
@@ -16,7 +17,7 @@ router = APIRouter(prefix="/store")
     dependencies=[authentication()],
     response_model=Result[dict],
     response_class=JSONResponse,
-    deprecated="获取插件商店插件信息",  # type: ignore
+    description="获取插件商店插件信息",  # type: ignore
 )
 async def _() -> Result[dict]:
     try:
@@ -25,7 +26,7 @@ async def _() -> Result[dict]:
 
         data = await ShopManage.get_data()
         plugin_list = [
-            {**data[name].dict(), "name": name, "id": idx}
+            {**data[name].to_dict(), "name": name, "id": idx}
             for idx, name in enumerate(data)
         ]
         modules = await PluginInfo.filter(load_status=True).values_list(
@@ -33,6 +34,7 @@ async def _() -> Result[dict]:
         )
         return Result.ok({"install_module": modules, "plugin_list": plugin_list})
     except Exception as e:
+        logger.error("获取插件商店插件信息失败", "WebUi", e=e)
         return Result.fail(f"获取插件商店插件信息失败: {type(e)}: {e}")
 
 
@@ -41,7 +43,7 @@ async def _() -> Result[dict]:
     dependencies=[authentication()],
     response_model=Result,
     response_class=JSONResponse,
-    deprecated="安装插件",  # type: ignore
+    description="安装插件",  # type: ignore
 )
 async def _(param: PluginIr) -> Result:
     try:
@@ -59,7 +61,7 @@ async def _(param: PluginIr) -> Result:
     dependencies=[authentication()],
     response_model=Result,
     response_class=JSONResponse,
-    deprecated="更新插件",  # type: ignore
+    description="更新插件",  # type: ignore
 )
 async def _(param: PluginIr) -> Result:
     try:
@@ -77,7 +79,7 @@ async def _(param: PluginIr) -> Result:
     dependencies=[authentication()],
     response_model=Result,
     response_class=JSONResponse,
-    deprecated="移除插件",  # type: ignore
+    description="移除插件",  # type: ignore
 )
 async def _(param: PluginIr) -> Result:
     try:

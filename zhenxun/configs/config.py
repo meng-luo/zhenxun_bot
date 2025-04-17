@@ -1,9 +1,11 @@
 from pathlib import Path
 
 import nonebot
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .utils import ConfigsManager
+
+__all__ = ["BotConfig", "Config"]
 
 
 class BotSetting(BaseModel):
@@ -13,9 +15,9 @@ class BotSetting(BaseModel):
     """系统代理"""
     db_url: str = ""
     """数据库链接"""
-    platform_superusers: dict[str, list[str]] = {}
+    platform_superusers: dict[str, list[str]] = Field(default_factory=dict)
     """平台超级用户"""
-    qbot_id_data: dict[str, str] = {}
+    qbot_id_data: dict[str, str] = Field(default_factory=dict)
     """官bot id:账号id"""
 
     def get_qbot_uid(self, qbot_id: str) -> str | None:

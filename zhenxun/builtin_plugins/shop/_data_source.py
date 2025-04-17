@@ -1,16 +1,18 @@
 import asyncio
 from collections.abc import Callable
+from datetime import datetime, timedelta
 import inspect
 import time
 from types import MappingProxyType
 from typing import Any, Literal
 
 from nonebot.adapters import Bot, Event
+from nonebot.compat import model_dump
 from nonebot_plugin_alconna import UniMessage, UniMsg
 from nonebot_plugin_uninfo import Uninfo
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, Field, create_model
+from tortoise.expressions import Q
 
-from zhenxun.configs.path_config import IMAGE_PATH
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.group_member_info import GroupInfoUser
@@ -19,27 +21,20 @@ from zhenxun.models.user_gold_log import UserGoldLog
 from zhenxun.models.user_props_log import UserPropsLog
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import GoldHandle, PropHandle
-from zhenxun.utils.image_utils import BuildImage, ImageTemplate, text2image
+from zhenxun.utils.image_utils import BuildImage, ImageTemplate
 from zhenxun.utils.platform import PlatformUtils
 
-ICON_PATH = IMAGE_PATH / "shop_icon"
-
-RANK_ICON_PATH = IMAGE_PATH / "_icon"
-
-PLATFORM_PATH = {
-    "dodo": RANK_ICON_PATH / "dodo.png",
-    "discord": RANK_ICON_PATH / "discord.png",
-    "kaiheila": RANK_ICON_PATH / "kook.png",
-    "qq": RANK_ICON_PATH / "qq.png",
-}
+from .config import ICON_PATH, PLATFORM_PATH, base_config
+from .html_image import html_image
+from .normal_image import normal_image
 
 
 class Goods(BaseModel):
     name: str
     """商品名称"""
-    before_handle: list[Callable] = []
+    before_handle: list[Callable] = Field(default_factory=list)
     """使用前函数"""
-    after_handle: list[Callable] = []
+    after_handle: list[Callable] = Field(default_factory=list)
     """使用后函数"""
     func: Callable | None = None
     """使用函数"""
@@ -78,6 +73,14 @@ class ShopParam(BaseModel):
     """Uninfo"""
     message: UniMsg
     """UniMessage"""
+    extra_data: dict[str, Any] = Field(default_factory=dict)
+    """额外数据"""
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def to_dict(self, **kwargs):
+        return model_dump(self, **kwargs)
 
 
 async def gold_rank(
@@ -118,7 +121,7 @@ async def gold_rank(
         )
         data_list.append(
             [
-                f"{i+1}",
+                f"{i + 1}",
                 (ava_bytes, 30, 30) if platform == "qq" else "",
                 uid2name.get(user[0]),
                 user[1],
@@ -136,6 +139,12 @@ async def gold_rank(
 
 class ShopManage:
     uuid2goods: dict[str, Goods] = {}  # noqa: RUF012
+
+    @classmethod
+    async def get_shop_image(cls) -> bytes:
+        if base_config.get("style") == "zhenxun":
+            return await html_image()
+        return await normal_image()
 
     @classmethod
     def __build_params(
@@ -185,7 +194,6 @@ class ShopManage:
             "num": num,
             "text": text,
             "goods_name": goods.name,
-            "message": message,
         }
 
     @classmethod
@@ -194,8 +202,9 @@ class ShopManage:
         args: MappingProxyType,
         param: ShopParam,
         session: Uninfo,
+        message: UniMsg,
         **kwargs,
-    ) -> list[Any]:
+    ) -> dict:
         """解析参数
 
         参数:
@@ -203,31 +212,30 @@ class ShopManage:
             param: ShopParam
 
         返回:
-            list[Any]: 参数
+            dict: 参数
         """
-        param_list = []
         _bot = param.bot
         param.bot = None
-        param_json = param.dict()
-        param_json["bot"] = _bot
-        for par in args.keys():
-            if par in ["shop_param"]:
-                param_list.append(param)
-            elif par in ["session"]:
-                param_list.append(session)
-            elif par in ["message"]:
-                param_list.append(kwargs.get("message"))
-            elif par not in ["args", "kwargs"]:
-                param_list.append(param_json.get(par))
-                if kwargs.get(par) is not None:
-                    del kwargs[par]
-        return param_list
+        param_json = {
+            "bot": _bot,
+            "kwargs": kwargs,
+            **param.to_dict(),
+            **param.extra_data,
+            "session": session,
+            "message": message,
+        }
+        for key in list(param_json.keys()):
+            if key not in args:
+                del param_json[key]
+        return param_json
 
     @classmethod
     async def run_before_after(
         cls,
         goods: Goods,
         param: ShopParam,
+        session: Uninfo,
+        message: UniMsg,
         run_type: Literal["after", "before"],
         **kwargs,
     ):
@@ -241,16 +249,19 @@ class ShopManage:
         fun_list = goods.before_handle if run_type == "before" else goods.after_handle
         if fun_list:
             for func in fun_list:
-                args = inspect.signature(func).parameters
-                if args and next(iter(args.keys())) != "kwargs":
+                if args := inspect.signature(func).parameters:
                     if asyncio.iscoroutinefunction(func):
-                        await func(*cls.__parse_args(args, param, **kwargs))
+                        await func(
+                            **cls.__parse_args(args, param, session, message, **kwargs)
+                        )
                     else:
-                        func(*cls.__parse_args(args, param, **kwargs))
+                        func(
+                            **cls.__parse_args(args, param, session, message, **kwargs)
+                        )
                 elif asyncio.iscoroutinefunction(func):
-                    await func(**kwargs)
+                    await func()
                 else:
-                    func(**kwargs)
+                    func()
 
     @classmethod
     async def __run(
@@ -258,6 +269,7 @@ class ShopManage:
         goods: Goods,
         param: ShopParam,
         session: Uninfo,
+        message: UniMsg,
         **kwargs,
     ) -> str | UniMessage | None:
         """运行道具函数
@@ -271,18 +283,20 @@ class ShopManage:
         """
         args = inspect.signature(goods.func).parameters  # type: ignore
         if goods.func:
-            if args and next(iter(args.keys())) != "kwargs":
+            if args:
                 return (
-                    await goods.func(*cls.__parse_args(args, param, session, **kwargs))
+                    await goods.func(
+                        **cls.__parse_args(args, param, session, message, **kwargs)
+                    )
                     if asyncio.iscoroutinefunction(goods.func)
-                    else goods.func(*cls.__parse_args(args, param, session, **kwargs))
+                    else goods.func(
+                        **cls.__parse_args(args, param, session, message, **kwargs)
+                    )
                 )
             if asyncio.iscoroutinefunction(goods.func):
-                return await goods.func(
-                    **kwargs,
-                )
+                return await goods.func()
             else:
-                return goods.func(**kwargs)
+                return goods.func()
 
     @classmethod
     async def use(
@@ -330,10 +344,12 @@ class ShopManage:
         )
         if num > param.max_num_limit:
             return f"{goods_info.goods_name} 单次使用最大数量为{param.max_num_limit}..."
-        await cls.run_before_after(goods, param, "before", **kwargs)
-        result = await cls.__run(goods, param, session, **kwargs)
-        await UserConsole.use_props(session.id1, goods_info.uuid, num, session.platform)  # type: ignore
-        await cls.run_before_after(goods, param, "after", **kwargs)
+        await cls.run_before_after(goods, param, session, message, "before", **kwargs)
+        result = await cls.__run(goods, param, session, message, **kwargs)
+        await UserConsole.use_props(
+            session.user.id, goods_info.uuid, num, PlatformUtils.get_platform(session)
+        )
+        await cls.run_before_after(goods, param, session, message, "after", **kwargs)
         if not result and param.send_success_msg:
             result = f"使用道具 {goods.name} {num} 次成功！"
         return result
@@ -365,10 +381,14 @@ class ShopManage:
         """
         if uuid in cls.uuid2goods:
             raise ValueError("该商品使用函数已被注册！")
-        kwargs["send_success_msg"] = send_success_msg
-        kwargs["max_num_limit"] = max_num_limit
         cls.uuid2goods[uuid] = Goods(
-            model=create_model(f"{uuid}_model", __base__=ShopParam, **kwargs),
+            model=create_model(
+                f"{uuid}_model",
+                __base__=ShopParam,
+                send_success_msg=(bool, Field(default=send_success_msg)),
+                max_num_limit=(int, Field(default=max_num_limit)),
+                extra_data=(dict[str, Any], Field(default=kwargs)),
+            ),
             params=kwargs,
             before_handle=before_handle,
             after_handle=after_handle,
@@ -391,17 +411,19 @@ class ShopManage:
         返回:
             str: 返回小
         """
-        if name == "神秘药水":
-            return "你们看看就好啦，这是不可能卖给你们的~"
         if num < 0:
             return "购买的数量要大于0!"
-        goods_list = await GoodsInfo.annotate().order_by("id").all()
-        goods_list = [
-            goods
-            for goods in goods_list
-            if goods.goods_limit_time > time.time() or goods.goods_limit_time == 0
-        ]
+        goods_list = (
+            await GoodsInfo.filter(
+                Q(goods_limit_time__gte=time.time()) | Q(goods_limit_time=0)
+            )
+            .annotate()
+            .order_by("id")
+            .all()
+        )
         if name.isdigit():
+            if int(name) > len(goods_list) or int(name) <= 0:
+                return "道具编号不存在..."
             goods = goods_list[int(name) - 1]
         elif filter_goods := [g for g in goods_list if g.goods_name == name]:
             goods = filter_goods[0]
@@ -411,8 +433,15 @@ class ShopManage:
         price = goods.goods_price * num * goods.goods_discount
         if user.gold < price:
             return "糟糕! 您的金币好像不太够哦..."
+        today = datetime.now()
+        create_time = today - timedelta(
+            hours=today.hour, minutes=today.minute, seconds=today.second
+        )
         count = await UserPropsLog.filter(
-            user_id=user_id, handle=PropHandle.BUY
+            user_id=user_id,
+            handle=PropHandle.BUY,
+            uuid=goods.uuid,
+            create_time__gte=create_time,
         ).count()
         if goods.daily_limit and count >= goods.daily_limit:
             return "今天的购买已达限制了喔!"
@@ -449,24 +478,42 @@ class ShopManage:
         user = await UserConsole.get_user(user_id, platform)
         if not user.props:
             return None
-        result = await GoodsInfo.filter(uuid__in=user.props.keys()).all()
-        data_list = []
-        uuid2goods = {item.uuid: item for item in result}
-        column_name = ["-", "使用ID", "名称", "数量", "简介"]
-        for i, p in enumerate(user.props):
-            if prop := uuid2goods.get(p):
-                data_list.append(
-                    [
-                        (ICON_PATH / prop.icon, 33, 33) if prop.icon else "",
-                        i,
-                        prop.goods_name,
-                        user.props[p],
-                        prop.goods_description,
-                    ]
-                )
 
+        user.props = {uuid: count for uuid, count in user.props.items() if count > 0}
+
+        goods_list = await GoodsInfo.filter(uuid__in=user.props.keys()).all()
+        goods_by_uuid = {item.uuid: item for item in goods_list}
+
+        table_rows = []
+        for i, prop_uuid in enumerate(user.props):
+            prop = goods_by_uuid.get(prop_uuid)
+            if not prop:
+                continue
+
+            icon = ""
+            if prop.icon:
+                icon_path = ICON_PATH / prop.icon
+                icon = (icon_path, 33, 33) if icon_path.exists() else ""
+
+            table_rows.append(
+                [
+                    icon,
+                    i,
+                    prop.goods_name,
+                    user.props[prop_uuid],
+                    prop.goods_description,
+                ]
+            )
+
+        if not table_rows:
+            return None
+
+        column_name = ["-", "使用ID", "名称", "数量", "简介"]
         return await ImageTemplate.table_page(
-            f"{name}的道具仓库", "", column_name, data_list
+            f"{name}的道具仓库",
+            "通过 使用道具[ID/名称] 令道具生效",
+            column_name,
+            table_rows,
         )
 
     @classmethod
@@ -482,200 +529,3 @@ class ShopManage:
         """
         user = await UserConsole.get_user(user_id, platform)
         return user.gold
-
-    @classmethod
-    async def build_shop_image(cls) -> BuildImage:
-        """制作商店图片
-
-        返回:
-            BuildImage: 商店图片
-        """
-        goods_lst = await GoodsInfo.get_all_goods()
-        h = 10
-        _list: list[GoodsInfo] = [
-            goods
-            for goods in goods_lst
-            if goods.goods_limit_time == 0 or time.time() < goods.goods_limit_time
-        ]
-        # A = BuildImage(1100, h, color="#f9f6f2")
-        total_n = 0
-        image_list = []
-        for idx, goods in enumerate(_list):
-            name_image = BuildImage(
-                580, 40, font_size=25, color="#e67b6b", font="CJGaoDeGuo.otf"
-            )
-            await name_image.text(
-                (15, 0), f"{idx + 1}.{goods.goods_name}", center_type="height"
-            )
-            await name_image.line((380, -5, 280, 45), "#a29ad6", 5)
-            await name_image.text((390, 0), "售价：", center_type="height")
-            if goods.goods_discount != 1:
-                discount_price = int(goods.goods_discount * goods.goods_price)
-                old_price_image = await BuildImage.build_text_image(
-                    str(goods.goods_price), font_color=(194, 194, 194), size=15
-                )
-                await old_price_image.line(
-                    (
-                        0,
-                        int(old_price_image.height / 2),
-                        old_price_image.width + 1,
-                        int(old_price_image.height / 2),
-                    ),
-                    (0, 0, 0),
-                )
-                await name_image.paste(old_price_image, (440, 0))
-                await name_image.text((440, 15), str(discount_price), (255, 255, 255))
-            else:
-                await name_image.text(
-                    (440, 0),
-                    str(goods.goods_price),
-                    (255, 255, 255),
-                    center_type="height",
-                )
-            _tmp = await BuildImage.build_text_image(str(goods.goods_price), size=25)
-            await name_image.text(
-                (
-                    440 + _tmp.width,
-                    0,
-                ),
-                " 金币",
-                center_type="height",
-            )
-            des_image = None
-            font_img = BuildImage(600, 80, font_size=20, color="#a29ad6")
-            p = font_img.getsize("简介：")[0] + 20
-            if goods.goods_description:
-                des_list = goods.goods_description.split("\n")
-                desc = ""
-                for des in des_list:
-                    if font_img.getsize(des)[0] > font_img.width - p - 20:
-                        msg = ""
-                        tmp = ""
-                        for i in range(len(des)):
-                            if font_img.getsize(tmp)[0] < font_img.width - p - 20:
-                                tmp += des[i]
-                            else:
-                                msg += tmp + "\n"
-                                tmp = des[i]
-                        desc += msg
-                        if tmp:
-                            desc += tmp
-                    else:
-                        desc += des + "\n"
-                if desc[-1] == "\n":
-                    desc = desc[:-1]
-                des_image = await text2image(desc, color="#a29ad6")
-            goods_image = BuildImage(
-                600,
-                (50 + des_image.height) if des_image else 50,
-                font_size=20,
-                color="#a29ad6",
-                font="CJGaoDeGuo.otf",
-            )
-            if des_image:
-                await goods_image.text((15, 50), "简介：")
-                await goods_image.paste(des_image, (p, 50))
-            await name_image.circle_corner(5)
-            await goods_image.paste(name_image, (0, 5), center_type="width")
-            await goods_image.circle_corner(20)
-            bk = BuildImage(
-                1180,
-                (50 + des_image.height) if des_image else 50,
-                font_size=15,
-                color="#f9f6f2",
-                font="CJGaoDeGuo.otf",
-            )
-            if goods.icon and (ICON_PATH / goods.icon).exists():
-                icon = BuildImage(70, 70, background=ICON_PATH / goods.icon)
-                await bk.paste(icon)
-            await bk.paste(goods_image, (70, 0))
-            n = 0
-            _w = 650
-            # 添加限时图标和时间
-            if goods.goods_limit_time > 0:
-                n += 140
-                _limit_time_logo = BuildImage(
-                    40, 40, background=f"{IMAGE_PATH}/other/time.png"
-                )
-                await bk.paste(_limit_time_logo, (_w + 50, 0))
-                _time_img = await BuildImage.build_text_image("限时！", size=23)
-                await bk.paste(
-                    _time_img,
-                    (_w + 90, 10),
-                )
-                limit_time = time.strftime(
-                    "%Y-%m-%d %H:%M", time.localtime(goods.goods_limit_time)
-                ).split()
-                y_m_d = limit_time[0]
-                _h_m = limit_time[1].split(":")
-                h_m = f"{_h_m[0]}时 {_h_m[1]}分"
-                await bk.text((_w + 55, 38), str(y_m_d))
-                await bk.text((_w + 65, 57), str(h_m))
-                _w += 140
-            if goods.goods_discount != 1:
-                n += 140
-                _discount_logo = BuildImage(
-                    30, 30, background=f"{IMAGE_PATH}/other/discount.png"
-                )
-                await bk.paste(_discount_logo, (_w + 50, 10))
-                _tmp = await BuildImage.build_text_image("折扣！", size=23)
-                await bk.paste(_tmp, (_w + 90, 15))
-                _tmp = await BuildImage.build_text_image(
-                    f"{10 * goods.goods_discount:.1f} 折",
-                    size=30,
-                    font_color=(85, 156, 75),
-                )
-                await bk.paste(_tmp, (_w + 50, 44))
-                _w += 140
-            if goods.daily_limit != 0:
-                n += 140
-                _daily_limit_logo = BuildImage(
-                    35, 35, background=f"{IMAGE_PATH}/other/daily_limit.png"
-                )
-                await bk.paste(_daily_limit_logo, (_w + 50, 10))
-                _tmp = await BuildImage.build_text_image(
-                    "限购！",
-                    size=23,
-                )
-                await bk.paste(_tmp, (_w + 90, 20))
-                _tmp = await BuildImage.build_text_image(
-                    f"{goods.daily_limit}", size=30
-                )
-                await bk.paste(_tmp, (_w + 72, 45))
-            total_n = max(total_n, n)
-            if n:
-                await bk.line((650, -1, 650 + n, -1), "#a29ad6", 5)
-                # await bk.aline((650, 80, 650 + n, 80), "#a29ad6", 5)
-
-            # 添加限时图标和时间
-            image_list.append(bk)
-            # await A.apaste(bk, (0, current_h), True)
-            # current_h += 90
-        current_h = 0
-        h = sum(img.height + 10 for img in image_list) or 400
-        A = BuildImage(1100, h, color="#f9f6f2")
-        for img in image_list:
-            await A.paste(img, (0, current_h))
-            current_h += img.height + 10
-        w = 950
-        if total_n:
-            w += total_n
-        h = A.height + 230 + 100
-        h = max(h, 1000)
-        shop_logo = BuildImage(100, 100, background=f"{IMAGE_PATH}/other/shop_text.png")
-        shop = BuildImage(w, h, font_size=20, color="#f9f6f2")
-        await shop.paste(A, (20, 230))
-        await shop.paste(shop_logo, (450, 30))
-        tip = "注【通过 购买道具 序号 或者 商品名称 购买】"
-        await shop.text(
-            (
-                int((1000 - shop.getsize(tip)[0]) / 2),
-                170,
-            ),
-            "注【通过 序号 或者 商品名称 购买】",
-        )
-        await shop.text(
-            (20, h - 100),
-            "神秘药水\t\t售价：9999999金币\n\t\t鬼知道会有什么效果~",
-        )
-        return shop

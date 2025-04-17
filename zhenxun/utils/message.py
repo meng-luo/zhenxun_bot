@@ -7,6 +7,7 @@ from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot_plugin_alconna import (
     At,
     AtAll,
+    Button,
     CustomNode,
     Image,
     Reference,
@@ -16,6 +17,7 @@ from nonebot_plugin_alconna import (
     Voice,
 )
 from pydantic import BaseModel
+import ujson as json
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.services.log import logger
@@ -37,6 +39,7 @@ MESSAGE_TYPE = (
     | Text
     | Voice
     | Video
+    | Button
 )
 
 
@@ -58,13 +61,9 @@ class MessageUtils:
         config = nonebot.get_plugin_config(Config)
         message_list = []
         for msg in msg_list:
-            if isinstance(msg, Image | Text | At | AtAll | Video | Voice):
-                message_list.append(msg)
-            elif isinstance(msg, str):
+            if isinstance(msg, str):
                 if msg.startswith("base64://"):
                     message_list.append(Image(raw=BytesIO(base64.b64decode(msg[9:]))))
-                elif msg.startswith("http://"):
-                    message_list.append(Image(url=msg))
                 else:
                     message_list.append(Text(msg))
             elif isinstance(msg, int | float):
@@ -85,6 +84,8 @@ class MessageUtils:
                 message_list.append(Image(raw=msg))
             elif isinstance(msg, BuildImage):
                 message_list.append(Image(raw=msg.pic2bytes()))
+            else:
+                message_list.append(msg)
         return message_list
 
     @classmethod
@@ -138,6 +139,21 @@ class MessageUtils:
                 CustomNode(uid=uin, name=name, content=UniMessage(_message))
             )
         return UniMessage(Reference(nodes=node_list))
+
+    @classmethod
+    def markdown(cls, content: dict) -> Message:
+        """markdown格式消息
+
+        参数:
+            content: 消息内容
+
+        返回:
+            Message: 构造完成的消息
+        """
+        content_data = base64.b64encode(json.dumps(content).encode("utf-8")).decode(
+            "utf-8"
+        )
+        return Message(f"[CQ:markdown,data=base64://{content_data}]")
 
     @classmethod
     def custom_forward_msg(
