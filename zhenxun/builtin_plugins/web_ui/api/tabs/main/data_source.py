@@ -92,7 +92,7 @@ class ApiDataSource:
         """
         version_file = Path() / "__version__"
         if version_file.exists():
-            if text := version_file.open().read():
+            if text := version_file.open(encoding="utf-8").read():
                 return text.replace("__version__: ", "").strip()
         return "unknown"
 
@@ -119,7 +119,7 @@ class ApiDataSource:
                 (await PlatformUtils.get_friend_list(select_bot.bot))[0]
             )
         except Exception as e:
-            logger.warning("获取bot好友/群组信息失败...", "WebUi", e=e)
+            logger.warning("获取bot好友/群组数量失败...", "WebUi", e=e)
             select_bot.group_count = 0
             select_bot.friend_count = 0
         select_bot.status = await BotConsole.get_bot_status(select_bot.self_id)

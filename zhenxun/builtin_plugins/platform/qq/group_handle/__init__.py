@@ -1,4 +1,4 @@
-from nonebot import on_notice, on_request
+from nonebot import on_notice
 from nonebot.adapters import Bot
 from nonebot.adapters.onebot.v11 import (
     GroupDecreaseNoticeEvent,
@@ -14,9 +14,11 @@ from nonebot_plugin_uninfo import Uninfo
 from zhenxun.builtin_plugins.platform.qq.exception import ForceAddGroupError
 from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig, Task
+from zhenxun.models.event_log import EventLog
 from zhenxun.models.group_console import GroupConsole
+from zhenxun.services.cache import CacheRoot
 from zhenxun.utils.common_utils import CommonUtils
-from zhenxun.utils.enum import PluginType
+from zhenxun.utils.enum import EventLogType, PluginType
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.rules import notice_rule
 
@@ -52,22 +54,6 @@ __plugin_meta__ = PluginMetadata(
                 help="群欢迎消息cd",
                 default_value=5,
                 type=int,
-            ),
-            RegisterConfig(
-                module="_task",
-                key="DEFAULT_GROUP_WELCOME",
-                value=True,
-                help="被动 进群欢迎 进群默认开关状态",
-                default_value=True,
-                type=bool,
-            ),
-            RegisterConfig(
-                module="_task",
-                key="DEFAULT_REFUND_GROUP_REMIND",
-                value=True,
-                help="被动 退群提醒 进群默认开关状态",
-                default_value=True,
-                type=bool,
             ),
         ],
         tasks=[
@@ -106,8 +92,10 @@ group_decrease_handle = on_notice(
     rule=notice_rule([GroupMemberDecreaseEvent, GroupDecreaseNoticeEvent]),
 )
 """群员减少处理"""
-add_group = on_request(priority=1, block=False)
-"""加群同意请求"""
+
+cache = CacheRoot.cache_dict(
+    "REQUEST_CACHE", (base_config.get("TIP_MESSAGE_LIMIT") or 360) * 60, str
+)
 
 
 @group_increase_handle.handle()
@@ -126,7 +114,9 @@ async def _(
                 bot, str(event.operator_id), str(event.group_id), group
             )
         except ForceAddGroupError as e:
-            await PlatformUtils.send_superuser(bot, e.get_info())
+            if not cache.get(e.get_group_id()):
+                cache.set(e.get_group_id(), "1")
+                await PlatformUtils.send_superuser(bot, e.get_info())
     else:
         await GroupManager.add_user(session, bot)
 
@@ -141,8 +131,21 @@ async def _(
     group_id = str(event.group_id)
     if event.sub_type == "kick_me":
         """踢出Bot"""
-        await GroupManager.kick_bot(bot, user_id, group_id)
+        await GroupManager.kick_bot(bot, group_id, str(event.operator_id))
+        await EventLog.create(
+            user_id=user_id, group_id=group_id, event_type=EventLogType.KICK_BOT
+        )
     elif event.sub_type in ["leave", "kick"]:
+        if event.sub_type == "leave":
+            """主动退群"""
+            await EventLog.create(
+                user_id=user_id, group_id=group_id, event_type=EventLogType.LEAVE_MEMBER
+            )
+        else:
+            """被踢出群"""
+            await EventLog.create(
+                user_id=user_id, group_id=group_id, event_type=EventLogType.KICK_MEMBER
+            )
         result = await GroupManager.run_user(
             bot, user_id, group_id, str(event.operator_id), event.sub_type
         )

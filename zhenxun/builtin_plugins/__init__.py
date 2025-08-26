@@ -5,7 +5,7 @@ import nonebot
 from nonebot.adapters import Bot
 from nonebot.drivers import Driver
 from tortoise import Tortoise
-from tortoise.exceptions import OperationalError
+from tortoise.exceptions import IntegrityError, OperationalError
 import ujson as json
 
 from zhenxun.models.bot_connect_log import BotConnectLog
@@ -16,7 +16,8 @@ from zhenxun.models.sign_user import SignUser
 from zhenxun.models.user_console import UserConsole
 from zhenxun.services.log import logger
 from zhenxun.utils.decorator.shop import shop_register
-from zhenxun.utils.manager.resource_manager import ResourceManager
+from zhenxun.utils.manager.priority_manager import PriorityLifecycle
+from zhenxun.utils.manager.zhenxun_repo_manager import ZhenxunRepoManager
 from zhenxun.utils.platform import PlatformUtils
 
 driver: Driver = nonebot.get_driver()
@@ -29,9 +30,12 @@ async def _(bot: Bot):
         bot_id=bot.self_id, platform=bot.adapter, connect_time=datetime.now(), type=1
     )
     if not await BotConsole.exists(bot_id=bot.self_id):
-        await BotConsole.create(
-            bot_id=bot.self_id, platform=PlatformUtils.get_platform(bot)
-        )
+        try:
+            await BotConsole.create(
+                bot_id=bot.self_id, platform=PlatformUtils.get_platform(bot)
+            )
+        except IntegrityError as e:
+            logger.warning(f"记录bot: {bot.self_id} 数据已存在...", e=e)
 
 
 @driver.on_bot_disconnect
@@ -49,30 +53,40 @@ async def _(bot: Bot):
 
 
 SIGN_SQL = """
-select distinct on("user_id") t1.user_id, t1.checkin_count, t1.add_probability,
-t1.specify_probability, t1.impression
-from public.sign_group_users t1
-  join (
-    select user_id, max(t2.impression) as max_impression
-    from public.sign_group_users t2
-    group by user_id
-  ) t on t.user_id = t1.user_id and t.max_impression = t1.impression
+SELECT user_id, checkin_count, add_probability, specify_probability, impression
+FROM (
+    SELECT
+        t1.user_id,
+        t1.checkin_count,
+        t1.add_probability,
+        t1.specify_probability,
+        t1.impression,
+        ROW_NUMBER() OVER(PARTITION BY t1.user_id ORDER BY t1.impression DESC) AS rn
+    FROM sign_group_users t1
+    INNER JOIN (
+        SELECT user_id, MAX(impression) AS max_impression
+        FROM sign_group_users
+        GROUP BY user_id
+    ) t2 ON t2.user_id = t1.user_id AND t2.max_impression = t1.impression
+) t
+WHERE rn = 1
 """
 
 BAG_SQL = """
 select t1.user_id, t1.gold, t1.property
-from public.bag_users t1
+from bag_users t1
   join (
     select user_id, max(t2.gold) as max_gold
-    from public.bag_users t2
+    from bag_users t2
     group by user_id
   ) t on t.user_id = t1.user_id and t.max_gold = t1.gold
 """
 
 
-@driver.on_startup
+@PriorityLifecycle.on_startup(priority=5)
 async def _():
-    await ResourceManager.init_resources()
+    if not ZhenxunRepoManager.check_resources_exists():
+        await ZhenxunRepoManager.resources_update()
     """签到与用户的数据迁移"""
     if goods_list := await GoodsInfo.filter(uuid__isnull=True).all():
         for goods in goods_list:

@@ -1,29 +1,13 @@
-import os
+from typing import cast
 
-from zhenxun.configs.path_config import DATA_PATH, IMAGE_PATH
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.plugin_info import PluginInfo
 from zhenxun.models.task_info import TaskInfo
-from zhenxun.utils.enum import BlockType, PluginType
+from zhenxun.services.cache import CacheRoot
+from zhenxun.utils.common_utils import CommonUtils
+from zhenxun.utils.enum import BlockType, CacheType, PluginType
 from zhenxun.utils.exception import GroupInfoNotFound
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate, RowStyle
-
-HELP_FILE = IMAGE_PATH / "SIMPLE_HELP.png"
-
-GROUP_HELP_PATH = DATA_PATH / "group_help"
-
-
-def delete_help_image(gid: str | None = None):
-    """删除帮助图片"""
-    if gid:
-        for file in os.listdir(GROUP_HELP_PATH):
-            if file.startswith(f"{gid}"):
-                os.remove(GROUP_HELP_PATH / file)
-    else:
-        if HELP_FILE.exists():
-            HELP_FILE.unlink()
-        for file in GROUP_HELP_PATH.iterdir():
-            file.unlink()
 
 
 def plugin_row_style(column: str, text: str) -> RowStyle:
@@ -116,9 +100,7 @@ async def build_task(group_id: str | None) -> BuildImage:
     column_name = ["ID", "模块", "名称", "群组状态", "全局状态", "运行时间"]
     group = None
     if group_id:
-        group = await GroupConsole.get_or_none(
-            group_id=group_id, channel_id__isnull=True
-        )
+        group = await GroupConsole.get_group(group_id=group_id)
         if not group:
             raise GroupInfoNotFound()
     else:
@@ -155,7 +137,7 @@ async def build_task(group_id: str | None) -> BuildImage:
     )
 
 
-class PluginManage:
+class PluginManager:
     @classmethod
     async def set_default_status(cls, plugin_name: str, status: bool) -> str:
         """设置插件进群默认状态
@@ -200,26 +182,26 @@ class PluginManage:
             )
             return f"成功将所有功能进群默认状态修改为: {'开启' if status else '关闭'}"
         if group_id:
-            if group := await GroupConsole.get_or_none(
-                group_id=group_id, channel_id__isnull=True
-            ):
-                module_list = await PluginInfo.filter(
-                    plugin_type=PluginType.NORMAL
-                ).values_list("module", flat=True)
+            if group := await GroupConsole.get_group(group_id=group_id):
+                module_list = cast(
+                    list[str],
+                    await PluginInfo.filter(plugin_type=PluginType.NORMAL).values_list(
+                        "module", flat=True
+                    ),
+                )
                 if status:
-                    for module in module_list:
-                        group.block_plugin = group.block_plugin.replace(
-                            f"<{module},", ""
-                        )
+                    # 开启所有功能 - 清空禁用列表
+                    group.block_plugin = ""
                 else:
-                    module_list = [f"<{module}" for module in module_list]
-                    group.block_plugin = ",".join(module_list) + ","  # type: ignore
+                    # 关闭所有功能 - 将模块列表转换为禁用格式
+                    group.block_plugin = CommonUtils.convert_module_format(module_list)
                 await group.save(update_fields=["block_plugin"])
                 return f"成功将此群组所有功能状态修改为: {'开启' if status else '关闭'}"
             return "获取群组失败..."
         await PluginInfo.filter(plugin_type=PluginType.NORMAL).update(
             status=status, block_type=None if status else BlockType.ALL
         )
+        await CacheRoot.invalidate_cache(CacheType.PLUGINS)
         return f"成功将所有功能全局状态修改为: {'开启' if status else '关闭'}"
 
     @classmethod
@@ -232,9 +214,7 @@ class PluginManage:
         返回:
             bool: 是否醒来
         """
-        if c := await GroupConsole.get_or_none(
-            group_id=group_id, channel_id__isnull=True
-        ):
+        if c := await GroupConsole.get_group(group_id=group_id):
             return c.status
         return False
 
@@ -245,9 +225,11 @@ class PluginManage:
         参数:
             group_id: 群组id
         """
-        await GroupConsole.filter(group_id=group_id, channel_id__isnull=True).update(
-            status=False
+        group, _ = await GroupConsole.get_or_create(
+            group_id=group_id, channel_id__isnull=True
         )
+        group.status = False
+        await group.save(update_fields=["status"])
 
     @classmethod
     async def wake(cls, group_id: str):
@@ -256,9 +238,11 @@ class PluginManage:
         参数:
             group_id: 群组id
         """
-        await GroupConsole.filter(group_id=group_id, channel_id__isnull=True).update(
-            status=True
+        group, _ = await GroupConsole.get_or_create(
+            group_id=group_id, channel_id__isnull=True
         )
+        group.status = True
+        await group.save(update_fields=["status"])
 
     @classmethod
     async def block(cls, module: str):
@@ -267,7 +251,9 @@ class PluginManage:
         参数:
             module: 模块名
         """
-        await PluginInfo.filter(module=module).update(status=False)
+        if plugin := await PluginInfo.get_plugin(module=module):
+            plugin.status = False
+            await plugin.save(update_fields=["status"])
 
     @classmethod
     async def unblock(cls, module: str):
@@ -276,7 +262,9 @@ class PluginManage:
         参数:
             module: 模块名
         """
-        await PluginInfo.filter(module=module).update(status=True)
+        if plugin := await PluginInfo.get_plugin(module=module):
+            plugin.status = True
+            await plugin.save(update_fields=["status"])
 
     @classmethod
     async def block_group_plugin(cls, plugin_name: str, group_id: str) -> str:
@@ -342,17 +330,21 @@ class PluginManage:
         return await cls._change_group_task("", group_id, True, True)
 
     @classmethod
-    async def block_global_all_task(cls) -> str:
+    async def block_global_all_task(cls, is_default: bool) -> str:
         """禁用全局被动技能
 
         返回:
             str: 返回信息
         """
-        await TaskInfo.all().update(status=False)
-        return "已全局禁用所有被动状态"
+        if is_default:
+            await TaskInfo.all().update(default_status=False)
+            return "已禁用所有被动进群默认状态"
+        else:
+            await TaskInfo.all().update(status=False)
+            return "已全局禁用所有被动状态"
 
     @classmethod
-    async def block_global_task(cls, name: str) -> str:
+    async def block_global_task(cls, name: str, is_default: bool = False) -> str:
         """禁用全局被动技能
 
         参数:
@@ -361,31 +353,47 @@ class PluginManage:
         返回:
             str: 返回信息
         """
-        await TaskInfo.filter(name=name).update(status=False)
-        return f"已全局禁用被动状态 {name}"
+        if is_default:
+            await TaskInfo.filter(name=name).update(default_status=False)
+            return f"已禁用被动进群默认状态 {name}"
+        else:
+            await TaskInfo.filter(name=name).update(status=False)
+            return f"已全局禁用被动状态 {name}"
 
     @classmethod
-    async def unblock_global_all_task(cls) -> str:
+    async def unblock_global_all_task(cls, is_default: bool) -> str:
         """开启全局被动技能
+
+        参数:
+            is_default: 是否为默认状态
 
         返回:
             str: 返回信息
         """
-        await TaskInfo.all().update(status=True)
-        return "已全局开启所有被动状态"
+        if is_default:
+            await TaskInfo.all().update(default_status=True)
+            return "已开启所有被动进群默认状态"
+        else:
+            await TaskInfo.all().update(status=True)
+            return "已全局开启所有被动状态"
 
     @classmethod
-    async def unblock_global_task(cls, name: str) -> str:
+    async def unblock_global_task(cls, name: str, is_default: bool = False) -> str:
         """开启全局被动技能
 
         参数:
             name: 被动技能名称
+            is_default: 是否为默认状态
 
         返回:
             str: 返回信息
         """
-        await TaskInfo.filter(name=name).update(status=True)
-        return f"已全局开启被动状态 {name}"
+        if is_default:
+            await TaskInfo.filter(name=name).update(default_status=True)
+            return f"已开启被动进群默认状态 {name}"
+        else:
+            await TaskInfo.filter(name=name).update(status=True)
+            return f"已全局开启被动状态 {name}"
 
     @classmethod
     async def unblock_group_plugin(cls, plugin_name: str, group_id: str) -> str:
@@ -417,17 +425,18 @@ class PluginManage:
         """
         status_str = "关闭" if status else "开启"
         if is_all:
-            modules = await TaskInfo.annotate().values_list("module", flat=True)
-            if modules:
+            module_list = cast(
+                list[str], await TaskInfo.annotate().values_list("module", flat=True)
+            )
+            if module_list:
                 group, _ = await GroupConsole.get_or_create(
                     group_id=group_id, channel_id__isnull=True
                 )
-                modules = [f"<{module}" for module in modules]
                 if status:
-                    group.block_task = ",".join(modules) + ","  # type: ignore
+                    group.block_task = CommonUtils.convert_module_format(module_list)
                 else:
-                    for module in modules:
-                        group.block_task = group.block_task.replace(f"{module},", "")
+                    # 开启所有模块 - 清空禁用列表
+                    group.block_task = ""
                 await group.save(update_fields=["block_task"])
                 return f"已成功{status_str}全部被动技能!"
         elif task := await TaskInfo.get_or_none(name=task_name):

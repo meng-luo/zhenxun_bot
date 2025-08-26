@@ -13,17 +13,13 @@ from nonebot_plugin_alconna import (
 )
 from nonebot_plugin_uninfo import Uninfo
 
-from zhenxun.builtin_plugins.help._config import (
-    GROUP_HELP_PATH,
-    SIMPLE_DETAIL_HELP_IMAGE,
-    SIMPLE_HELP_IMAGE,
-)
+from zhenxun.configs.config import Config
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 
-from ._data_source import create_help_img, get_plugin_help
+from ._data_source import create_help_img, get_llm_help, get_plugin_help
 
 __plugin_meta__ = PluginMetadata(
     name="帮助",
@@ -36,11 +32,40 @@ __plugin_meta__ = PluginMetadata(
         is_show=False,
         configs=[
             RegisterConfig(
-                key="type",
-                value="normal",
-                help="帮助图片样式 ['normal', 'HTML', 'zhenxun']",
-                default_value="zhenxun",
-            )
+                key="ENABLE_LLM_HELPER",
+                value=False,
+                help="是否开启LLM智能帮助功能",
+                default_value=False,
+                type=bool,
+            ),
+            RegisterConfig(
+                key="DEFAULT_LLM_MODEL",
+                value="Gemini/gemini-2.5-flash-lite-preview-06-17",
+                help="智能帮助功能使用的默认LLM模型",
+                default_value="Gemini/gemini-2.5-flash-lite-preview-06-17",
+                type=str,
+            ),
+            RegisterConfig(
+                key="LLM_HELPER_STYLE",
+                value="绪山真寻",
+                help="设置智能帮助功能的回复口吻或风格",
+                default_value="绪山真寻",
+                type=str,
+            ),
+            RegisterConfig(
+                key="LLM_HELPER_REPLY_AS_IMAGE_THRESHOLD",
+                value=100,
+                help="AI帮助回复超过多少字时转为图片发送",
+                default_value=100,
+                type=int,
+            ),
+            RegisterConfig(
+                key="HELP_STYLE",
+                value="default",
+                help="帮助页面的显示样式 (可选值: 'default', 'simple')",
+                default_value="default",
+                type=str,
+            ),
         ],
     ).to_dict(),
 )
@@ -77,26 +102,40 @@ async def _(
     is_detail: Query[bool] = AlconnaQuery("detail.value", False),
 ):
     _is_superuser = is_superuser.result if is_superuser.available else False
+
+    if _is_superuser and session.user.id not in bot.config.superusers:
+        await MessageUtils.build_message("权限不足，无法查看超级用户帮助").finish(
+            reply_to=True
+        )
+
     if name.available:
-        if _is_superuser and session.user.id not in bot.config.superusers:
-            _is_superuser = False
-        if result := await get_plugin_help(session.user.id, name.result, _is_superuser):
-            await MessageUtils.build_message(result).send(reply_to=True)
-        else:
-            await MessageUtils.build_message("没有此功能的帮助信息...").send(
+        traditional_help_result = await get_plugin_help(
+            session.user.id, name.result, _is_superuser
+        )
+
+        is_plugin_found = not (
+            isinstance(traditional_help_result, str)
+            and "没有查找到这个功能噢..." in traditional_help_result
+        )
+        if is_plugin_found:
+            await MessageUtils.build_message(traditional_help_result).send(
                 reply_to=True
             )
-        logger.info(f"查看帮助详情: {name.result}", "帮助", session=session)
-    elif session.group and (gid := session.group.id):
-        _image_path = GROUP_HELP_PATH / f"{gid}_{is_detail.result}.png"
-        if not _image_path.exists():
-            result = await create_help_img(session, gid, is_detail.result)
-        await MessageUtils.build_message(_image_path).finish()
-    else:
-        if is_detail.result:
-            _image_path = SIMPLE_DETAIL_HELP_IMAGE
+            logger.info(f"查看帮助详情: {name.result}", "帮助", session=session)
+        elif Config.get_config("help", "ENABLE_LLM_HELPER"):
+            logger.info(f"智能帮助处理问题: {name.result}", "帮助", session=session)
+            llm_answer = await get_llm_help(name.result, session.user.id)
+            await MessageUtils.build_message(llm_answer).send(reply_to=True)
         else:
-            _image_path = SIMPLE_HELP_IMAGE
-        if not _image_path.exists():
-            result = await create_help_img(session, None, is_detail.result)
-        await MessageUtils.build_message(_image_path).finish()
+            await MessageUtils.build_message(traditional_help_result).send(
+                reply_to=True
+            )
+            logger.info(
+                f"查看帮助详情失败，未找到: {name.result}", "帮助", session=session
+            )
+    elif session.group and (gid := session.group.id):
+        image_bytes = await create_help_img(session, gid, is_detail.result)
+        await MessageUtils.build_message(image_bytes).finish()
+    else:
+        image_bytes = await create_help_img(session, None, is_detail.result)
+        await MessageUtils.build_message(image_bytes).finish()

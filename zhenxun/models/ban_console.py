@@ -1,10 +1,13 @@
 import time
+from typing import ClassVar
 from typing_extensions import Self
 
 from tortoise import fields
 
+from zhenxun.services.data_access import DataAccess
 from zhenxun.services.db_context import Model
 from zhenxun.services.log import logger
+from zhenxun.utils.enum import CacheType, DbLockType
 from zhenxun.utils.exception import UserAndGroupIsNone
 
 
@@ -19,6 +22,8 @@ class BanConsole(Model):
     """使用ban命令的用户等级"""
     ban_time = fields.BigIntField()
     """ban开始的时间"""
+    ban_reason = fields.TextField(null=True, default=None)
+    """ban的理由"""
     duration = fields.BigIntField()
     """ban时长"""
     operator = fields.CharField(255)
@@ -27,6 +32,15 @@ class BanConsole(Model):
     class Meta:  # pyright: ignore [reportIncompatibleVariableOverride]
         table = "ban_console"
         table_description = "封禁人员/群组数据表"
+        unique_together = ("user_id", "group_id")
+        indexes = [("user_id",), ("group_id",)]  # noqa: RUF012
+
+    cache_type = CacheType.BAN
+    """缓存类型"""
+    cache_key_field = ("user_id", "group_id")
+    """缓存键字段"""
+    enable_lock: ClassVar[list[DbLockType]] = [DbLockType.CREATE, DbLockType.UPSERT]
+    """开启锁"""
 
     @classmethod
     async def _get_data(cls, user_id: str | None, group_id: str | None) -> Self | None:
@@ -44,14 +58,15 @@ class BanConsole(Model):
         """
         if not user_id and not group_id:
             raise UserAndGroupIsNone()
+        dao = DataAccess(cls)
         if user_id:
             return (
-                await cls.get_or_none(user_id=user_id, group_id=group_id)
+                await dao.safe_get_or_none(user_id=user_id, group_id=group_id)
                 if group_id
-                else await cls.get_or_none(user_id=user_id, group_id__isnull=True)
+                else await dao.safe_get_or_none(user_id=user_id, group_id__isnull=True)
             )
         else:
-            return await cls.get_or_none(user_id="", group_id=group_id)
+            return await dao.safe_get_or_none(user_id="", group_id=group_id)
 
     @classmethod
     async def check_ban_level(
@@ -96,7 +111,9 @@ class BanConsole(Model):
             if user.duration == -1:
                 return -1
             _time = time.time() - (user.ban_time + user.duration)
-            return 0 if _time > 0 else int(time.time() - user.ban_time - user.duration)
+            if _time < 0:
+                return int(abs(_time))
+            await user.delete()
         return 0
 
     @classmethod
@@ -122,6 +139,7 @@ class BanConsole(Model):
         user_id: str | None,
         group_id: str | None,
         ban_level: int,
+        reason: str | None,
         duration: int,
         operator: str | None = None,
     ):
@@ -146,6 +164,7 @@ class BanConsole(Model):
             group_id=group_id,
             ban_level=ban_level,
             ban_time=int(time.time()),
+            ban_reason=reason,
             duration=duration,
             operator=operator or 0,
         )
@@ -167,3 +186,33 @@ class BanConsole(Model):
             await user.delete()
             return True
         return False
+
+    @classmethod
+    async def get_ban(
+        cls,
+        *,
+        id: int | None = None,
+        user_id: str | None = None,
+        group_id: str | None = None,
+    ) -> Self | None:
+        """安全地获取ban记录
+
+        参数:
+            id: 记录id
+            user_id: 用户id
+            group_id: 群组id
+
+        返回:
+            Self | None: ban记录
+        """
+        if id is not None:
+            return await cls.safe_get_or_none(id=id)
+        return await cls._get_data(user_id, group_id)
+
+    @classmethod
+    async def _run_script(cls):
+        return [
+            "CREATE INDEX idx_ban_console_user_id ON ban_console(user_id);",
+            "CREATE INDEX idx_ban_console_group_id ON ban_console(group_id);",
+            "ALTER TABLE ban_console ADD COLUMN ban_reason TEXT DEFAULT NULL;",
+        ]

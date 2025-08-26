@@ -1,4 +1,5 @@
 import asyncio
+from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta
 import inspect
@@ -7,12 +8,13 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from nonebot.adapters import Bot, Event
-from nonebot.compat import model_dump
-from nonebot_plugin_alconna import UniMessage, UniMsg
+from nonebot_plugin_alconna import At, UniMessage, UniMsg
 from nonebot_plugin_uninfo import Uninfo
 from pydantic import BaseModel, Field, create_model
 from tortoise.expressions import Q
 
+from zhenxun import ui
+from zhenxun.configs.config import BotConfig
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.goods_info import GoodsInfo
 from zhenxun.models.group_member_info import GroupInfoUser
@@ -23,10 +25,9 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import GoldHandle, PropHandle
 from zhenxun.utils.image_utils import BuildImage, ImageTemplate
 from zhenxun.utils.platform import PlatformUtils
+from zhenxun.utils.pydantic_compat import model_dump
 
-from .config import ICON_PATH, PLATFORM_PATH, base_config
-from .html_image import html_image
-from .normal_image import normal_image
+from .config import ICON_PATH, PLATFORM_PATH
 
 
 class Goods(BaseModel):
@@ -48,6 +49,10 @@ class Goods(BaseModel):
     """model"""
     session: Uninfo | None = None
     """Uninfo"""
+    at_user: str | None = None
+    """At对象"""
+    at_users: list[str] = []
+    """At对象列表"""
 
 
 class ShopParam(BaseModel):
@@ -73,6 +78,10 @@ class ShopParam(BaseModel):
     """Uninfo"""
     message: UniMsg
     """UniMessage"""
+    at_user: str | None = None
+    """At对象"""
+    at_users: list[str] = []
+    """At对象列表"""
     extra_data: dict[str, Any] = Field(default_factory=dict)
     """额外数据"""
 
@@ -142,9 +151,7 @@ class ShopManage:
 
     @classmethod
     async def get_shop_image(cls) -> bytes:
-        if base_config.get("style") == "zhenxun":
-            return await html_image()
-        return await normal_image()
+        return await prepare_shop_data()
 
     @classmethod
     def __build_params(
@@ -156,6 +163,7 @@ class ShopManage:
         goods: Goods,
         num: int,
         text: str,
+        at_users: list[str] = [],
     ) -> tuple[ShopParam, dict[str, Any]]:
         """构造参数
 
@@ -165,6 +173,7 @@ class ShopManage:
             goods_name: 商品名称
             num: 数量
             text: 其他信息
+            at_users: at用户
         """
         group_id = None
         if session.group:
@@ -172,6 +181,7 @@ class ShopManage:
                 session.group.parent.id if session.group.parent else session.group.id
             )
         _kwargs = goods.params
+        at_user = at_users[0] if at_users else None
         model = goods.model(
             **{
                 "goods_name": goods.name,
@@ -183,6 +193,8 @@ class ShopManage:
                 "text": text,
                 "session": session,
                 "message": message,
+                "at_user": at_user,
+                "at_users": at_users,
             }
         )
         return model, {
@@ -194,6 +206,8 @@ class ShopManage:
             "num": num,
             "text": text,
             "goods_name": goods.name,
+            "at_user": at_user,
+            "at_users": at_users,
         }
 
     @classmethod
@@ -223,6 +237,7 @@ class ShopManage:
             **param.extra_data,
             "session": session,
             "message": message,
+            "shop_param": ShopParam,
         }
         for key in list(param_json.keys()):
             if key not in args:
@@ -308,6 +323,7 @@ class ShopManage:
         goods_name: str,
         num: int,
         text: str,
+        at_users: list[At] = [],
     ) -> str | UniMessage | None:
         """使用道具
 
@@ -319,6 +335,7 @@ class ShopManage:
             goods_name: 商品名称
             num: 使用数量
             text: 其他信息
+            at_users: at用户
 
         返回:
             str | MessageFactory | None: 使用完成后返回信息
@@ -326,6 +343,16 @@ class ShopManage:
         if goods_name.isdigit():
             try:
                 user = await UserConsole.get_user(user_id=session.user.id)
+                goods_list = await GoodsInfo.filter(uuid__in=user.props.keys()).all()
+                goods_by_uuid = {item.uuid: item for item in goods_list}
+                props_str = str(user.props)
+                user.props = {
+                    uuid: count
+                    for uuid, count in user.props.items()
+                    if count > 0 and goods_by_uuid.get(uuid)
+                }
+                if props_str != str(user.props):
+                    await user.save(update_fields=["props"])
                 uuid = list(user.props.keys())[int(goods_name)]
                 goods_info = await GoodsInfo.get_or_none(uuid=uuid)
             except IndexError:
@@ -339,16 +366,18 @@ class ShopManage:
         goods = cls.uuid2goods.get(goods_info.uuid)
         if not goods or not goods.func:
             return f"{goods_info.goods_name} 未注册使用函数, 无法使用..."
+        at_user_ids = [at.target for at in at_users]
         param, kwargs = cls.__build_params(
-            bot, event, session, message, goods, num, text
+            bot, event, session, message, goods, num, text, at_user_ids
         )
         if num > param.max_num_limit:
             return f"{goods_info.goods_name} 单次使用最大数量为{param.max_num_limit}..."
         await cls.run_before_after(goods, param, session, message, "before", **kwargs)
-        result = await cls.__run(goods, param, session, message, **kwargs)
         await UserConsole.use_props(
             session.user.id, goods_info.uuid, num, PlatformUtils.get_platform(session)
         )
+        result = await cls.__run(goods, param, session, message, **kwargs)
+
         await cls.run_before_after(goods, param, session, message, "after", **kwargs)
         if not result and param.send_success_msg:
             result = f"使用道具 {goods.name} {num} 次成功！"
@@ -479,10 +508,16 @@ class ShopManage:
         if not user.props:
             return None
 
-        user.props = {uuid: count for uuid, count in user.props.items() if count > 0}
-
         goods_list = await GoodsInfo.filter(uuid__in=user.props.keys()).all()
         goods_by_uuid = {item.uuid: item for item in goods_list}
+        props_str = str(user.props)
+        user.props = {
+            uuid: count
+            for uuid, count in user.props.items()
+            if count > 0 and goods_by_uuid.get(uuid)
+        }
+        if props_str != str(user.props):
+            await user.save(update_fields=["props"])
 
         table_rows = []
         for i, prop_uuid in enumerate(user.props):
@@ -529,3 +564,62 @@ class ShopManage:
         """
         user = await UserConsole.get_user(user_id, platform)
         return user.gold
+
+
+def get_limit_time(end_time: int) -> str | None:
+    now = int(time.time())
+    if now > end_time or end_time == 0:
+        return None
+    time_difference = datetime.fromtimestamp(end_time) - datetime.fromtimestamp(now)
+    total_seconds = time_difference.total_seconds()
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    return f"{hours}:{minutes:02d}"
+
+
+def get_discount(price: int, discount: float) -> int | None:
+    return None if discount == 1.0 else int(price * discount)
+
+
+async def prepare_shop_data() -> bytes:
+    """准备商店数据并调用渲染服务"""
+    goods_list = (
+        await GoodsInfo.filter(
+            Q(goods_limit_time__gte=time.time()) | Q(goods_limit_time=0)
+        )
+        .annotate()
+        .order_by("id")
+        .all()
+    )
+
+    partition_dict: dict[str, list[dict]] = defaultdict(list)
+    for idx, goods in enumerate(goods_list):
+        partition_name = goods.partition or "默认分区"
+
+        icon_asset_path = None
+        if goods.icon and (ICON_PATH / goods.icon).exists():
+            icon_asset_path = f"image/shop_icon/{goods.icon}"
+
+        goods_item = {
+            "id": idx + 1,
+            "name": goods.goods_name,
+            "description": goods.goods_description,
+            "price": goods.goods_price,
+            "discount_price": get_discount(goods.goods_price, goods.goods_discount),
+            "limit_time": get_limit_time(goods.goods_limit_time),
+            "daily_limit": goods.daily_limit or "∞",
+            "icon_url": icon_asset_path,
+        }
+        partition_dict[partition_name].append(goods_item)
+
+    categories = [
+        {"partition_title": partition, "goods_list": items}
+        for partition, items in partition_dict.items()
+    ]
+
+    shop_data = {
+        "bot_nickname": BotConfig.self_nickname,
+        "categories": categories,
+    }
+
+    return await ui.render_template("pages/builtin/shop", data=shop_data)

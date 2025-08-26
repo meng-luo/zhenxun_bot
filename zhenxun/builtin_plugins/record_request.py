@@ -1,7 +1,6 @@
 import asyncio
 from datetime import datetime
 import random
-import time
 
 from nonebot import on_message, on_request
 from nonebot.adapters.onebot.v11 import (
@@ -12,16 +11,17 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.adapters.onebot.v11 import Bot as v11Bot
 from nonebot.adapters.onebot.v12 import Bot as v12Bot
 from nonebot.plugin import PluginMetadata
-from nonebot_plugin_apscheduler import scheduler
 from nonebot_plugin_session import EventSession
 
 from zhenxun.configs.config import BotConfig, Config
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
+from zhenxun.models.event_log import EventLog
 from zhenxun.models.fg_request import FgRequest
 from zhenxun.models.friend_user import FriendUser
 from zhenxun.models.group_console import GroupConsole
+from zhenxun.services.cache import CacheRoot
 from zhenxun.services.log import logger
-from zhenxun.utils.enum import PluginType, RequestHandleType, RequestType
+from zhenxun.utils.enum import EventLogType, PluginType, RequestHandleType, RequestType
 from zhenxun.utils.platform import PlatformUtils
 
 base_config = Config.get("invite_manager")
@@ -51,22 +51,17 @@ __plugin_meta__ = PluginMetadata(
                 type=bool,
                 default_value=False,
             ),
+            RegisterConfig(
+                module="invite_manager",
+                key="TIP_MESSAGE_LIMIT",
+                value=360,
+                help="重复申请与退群提醒过滤时间（分钟）",
+                type=int,
+                default_value=360,
+            ),
         ],
     ).to_dict(),
 )
-
-
-class Timer:
-    data: dict[str, float] = {}  # noqa: RUF012
-
-    @classmethod
-    def check(cls, uid: int | str):
-        return True if uid not in cls.data else time.time() - cls.data[uid] > 5 * 60
-
-    @classmethod
-    def clear(cls):
-        now = time.time()
-        cls.data = {k: v for k, v in cls.data.items() if v - now < 5 * 60}
 
 
 # TODO: 其他平台请求
@@ -76,57 +71,75 @@ group_req = on_request(priority=5, block=True)
 _t = on_message(priority=999, block=False, rule=lambda: False)
 
 
+cache = CacheRoot.cache_dict("REQUEST_CACHE", 60, str)
+
+
 @friend_req.handle()
 async def _(bot: v12Bot | v11Bot, event: FriendRequestEvent, session: EventSession):
-    if event.user_id and Timer.check(event.user_id):
-        logger.debug("收录好友请求...", "好友请求", target=event.user_id)
-        user = await bot.get_stranger_info(user_id=event.user_id)
-        nickname = user["nickname"]
-        # sex = user["sex"]
-        # age = str(user["age"])
-        comment = event.comment
-        if base_config.get("AUTO_ADD_FRIEND"):
-            logger.debug(
-                "已开启好友请求自动同意，成功通过该请求",
-                "好友请求",
-                target=event.user_id,
-            )
-            await asyncio.sleep(random.randint(1, 10))
-            await bot.set_friend_add_request(flag=event.flag, approve=True)
-            await FriendUser.create(
-                user_id=str(user["user_id"]), user_name=user["nickname"]
-            )
-        else:
-            # 旧请求全部设置为过期
-            await FgRequest.filter(
-                request_type=RequestType.FRIEND,
-                user_id=str(event.user_id),
-                handle_type__isnull=True,
-            ).update(handle_type=RequestHandleType.EXPIRE)
-            f = await FgRequest.create(
-                request_type=RequestType.FRIEND,
-                platform=session.platform,
-                bot_id=bot.self_id,
-                flag=event.flag,
-                user_id=event.user_id,
-                nickname=nickname,
-                comment=comment,
-            )
-            await PlatformUtils.send_superuser(
+    logger.debug("收录好友请求...", "好友请求", target=event.user_id)
+    user = await bot.get_stranger_info(user_id=event.user_id)
+    nickname = user["nickname"]
+    # sex = user["sex"]
+    # age = str(user["age"])
+    comment = event.comment
+    if base_config.get("AUTO_ADD_FRIEND"):
+        logger.debug(
+            "已开启好友请求自动同意，成功通过该请求",
+            "好友请求",
+            target=event.user_id,
+        )
+        await asyncio.sleep(random.randint(1, 10))
+        await bot.set_friend_add_request(flag=event.flag, approve=True)
+        await FriendUser.create(
+            user_id=str(user["user_id"]), user_name=user["nickname"]
+        )
+    else:
+        # 旧请求全部设置为过期
+        await FgRequest.filter(
+            request_type=RequestType.FRIEND,
+            user_id=str(event.user_id),
+            handle_type__isnull=True,
+        ).update(handle_type=RequestHandleType.EXPIRE)
+        f = await FgRequest.create(
+            request_type=RequestType.FRIEND,
+            platform=session.platform,
+            bot_id=bot.self_id,
+            flag=event.flag,
+            user_id=event.user_id,
+            nickname=nickname,
+            comment=comment,
+        )
+        cache_key = str(event.user_id)
+        if not cache.get(cache_key):
+            cache.set(cache_key, "1")
+            results = await PlatformUtils.send_superuser(
                 bot,
                 f"*****一份好友申请*****\n"
                 f"ID: {f.id}\n"
                 f"昵称：{nickname}({event.user_id})\n"
                 f"自动同意：{'√' if base_config.get('AUTO_ADD_FRIEND') else '×'}\n"
-                f"日期：{str(datetime.now()).split('.')[0]}\n"
+                f"日期：{datetime.now().replace(microsecond=0)}\n"
                 f"备注：{event.comment}",
             )
-    else:
-        logger.debug("好友请求五分钟内重复, 已忽略", "好友请求", target=event.user_id)
+            if message_ids := [
+                str(r[1].msg_ids[0]["message_id"])
+                for r in results
+                if r[1] and r[1].msg_ids
+            ]:
+                f.message_ids = ",".join(message_ids)
+                await f.save(update_fields=["message_ids"])
+        else:
+            tip_limit = base_config.get("TIP_MESSAGE_LIMIT") or 360
+            logger.debug(
+                f"好友请求{tip_limit}分钟内重复, 已忽略",
+                "好友请求",
+                target=cache_key,
+            )
 
 
 @group_req.handle()
 async def _(bot: v12Bot | v11Bot, event: GroupRequestEvent, session: EventSession):
+    # sourcery skip: low-code-quality
     if event.sub_type != "invite":
         return
     if str(event.user_id) in bot.config.superusers or base_config.get("AUTO_ADD_GROUP"):
@@ -186,7 +199,7 @@ async def _(bot: v12Bot | v11Bot, event: GroupRequestEvent, session: EventSessio
                 group_id=str(event.group_id),
                 handle_type=RequestHandleType.APPROVE,
             )
-            await PlatformUtils.send_superuser(
+            results = await PlatformUtils.send_superuser(
                 bot,
                 f"*****一份入群申请*****\n"
                 f"ID：{f.id}\n"
@@ -201,7 +214,8 @@ async def _(bot: v12Bot | v11Bot, event: GroupRequestEvent, session: EventSessio
                 "\n在群组中 群组管理员与群主 允许使用管理员帮助"
                 "（包括ban与功能开关等）\n请在群组中发送 '管理员帮助'",
             )
-    elif Timer.check(f"{event.user_id}:{event.group_id}"):
+    elif not cache.get(f"{event.group_id}"):
+        cache.set(f"{event.group_id}", "1")
         logger.debug(
             f"收录 用户[{event.user_id}] 群聊[{event.group_id}] 群聊请求",
             "群聊请求",
@@ -230,28 +244,30 @@ async def _(bot: v12Bot | v11Bot, event: GroupRequestEvent, session: EventSessio
             nickname=nickname,
             group_id=str(event.group_id),
         )
-        await PlatformUtils.send_superuser(
+        kick_count = await EventLog.filter(
+            group_id=str(event.group_id), event_type=EventLogType.KICK_BOT
+        ).count()
+        kick_message = (
+            f"\n该群累计踢出{BotConfig.self_nickname} <{kick_count}>次"
+            if kick_count
+            else ""
+        )
+        results = await PlatformUtils.send_superuser(
             bot,
             f"*****一份入群申请*****\n"
             f"ID：{f.id}\n"
             f"申请人：{nickname}({event.user_id})\n群聊："
-            f"{event.group_id}\n邀请日期：{datetime.now().replace(microsecond=0)}",
+            f"{event.group_id}\n邀请日期：{datetime.now().replace(microsecond=0)}"
+            f"{kick_message}",
         )
+        if message_ids := [
+            str(r[1].msg_ids[0]["message_id"]) for r in results if r[1] and r[1].msg_ids
+        ]:
+            f.message_ids = ",".join(message_ids)
+            await f.save(update_fields=["message_ids"])
     else:
         logger.debug(
             "群聊请求五分钟内重复, 已忽略",
             "群聊请求",
             target=f"{event.user_id}:{event.group_id}",
         )
-
-
-@scheduler.scheduled_job(
-    "interval",
-    minutes=5,
-)
-async def _():
-    Timer.clear()
-
-
-async def _():
-    Timer.clear()

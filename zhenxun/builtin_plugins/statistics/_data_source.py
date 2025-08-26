@@ -1,5 +1,3 @@
-from datetime import datetime, timedelta
-
 from tortoise.functions import Count
 
 from zhenxun.models.group_console import GroupConsole
@@ -9,7 +7,7 @@ from zhenxun.models.statistics import Statistics
 from zhenxun.utils.echart_utils import ChartUtils
 from zhenxun.utils.echart_utils.models import Barh
 from zhenxun.utils.enum import PluginType
-from zhenxun.utils.image_utils import BuildImage
+from zhenxun.utils.time_utils import TimeUtils
 
 
 class StatisticsManage:
@@ -45,9 +43,7 @@ class StatisticsManage:
             title = f"{user.user_name if user else user_id} {day_type}功能调用统计"
         elif group_id:
             """查群组"""
-            group = await GroupConsole.get_or_none(
-                group_id=group_id, channel_id__isnull=True
-            )
+            group = await GroupConsole.get_group(group_id=group_id)
             title = f"{group.group_name if group else group_id} {day_type}功能调用统计"
         else:
             title = "功能调用统计"
@@ -63,13 +59,12 @@ class StatisticsManage:
     @classmethod
     async def get_global_statistics(
         cls, plugin_name: str | None, day: int | None, title: str
-    ) -> BuildImage | str:
+    ) -> bytes | str:
         query = Statistics
         if plugin_name:
             query = query.filter(plugin_name=plugin_name)
         if day:
-            time = datetime.now() - timedelta(days=day)
-            query = query.filter(create_time__gte=time)
+            query = query.filter(create_time__gte=TimeUtils.get_day_start())
         data_list = (
             await query.annotate(count=Count("id"))
             .group_by("plugin_name")
@@ -89,8 +84,7 @@ class StatisticsManage:
         if group_id:
             query = query.filter(group_id=group_id)
         if day:
-            time = datetime.now() - timedelta(days=day)
-            query = query.filter(create_time__gte=time)
+            query = query.filter(create_time__gte=TimeUtils.get_day_start())
         data_list = (
             await query.annotate(count=Count("id"))
             .group_by("plugin_name")
@@ -106,8 +100,7 @@ class StatisticsManage:
     async def get_group_statistics(cls, group_id: str, day: int | None, title: str):
         query = Statistics.filter(group_id=group_id)
         if day:
-            time = datetime.now() - timedelta(days=day)
-            query = query.filter(create_time__gte=time)
+            query = query.filter(create_time__gte=TimeUtils.get_day_start())
         data_list = (
             await query.annotate(count=Count("id"))
             .group_by("plugin_name")
@@ -120,7 +113,7 @@ class StatisticsManage:
         )
 
     @classmethod
-    async def __build_image(cls, data_list: list[tuple[str, int]], title: str):
+    async def __build_image(cls, data_list: list[tuple[str, int]], title: str) -> bytes:
         module2count = {x[0]: x[1] for x in data_list}
         plugin_info = await PluginInfo.filter(
             module__in=module2count.keys(),

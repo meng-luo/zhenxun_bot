@@ -2,7 +2,7 @@ from io import BytesIO
 
 from arclet.alconna import Args, Option
 from arclet.alconna.typing import CommandMeta
-from nonebot.adapters import Bot
+from nonebot.adapters import Bot, Event
 from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import to_me
@@ -10,11 +10,14 @@ from nonebot_plugin_alconna import (
     Alconna,
     AlconnaQuery,
     Arparma,
+    Match,
     Query,
+    Reply,
     on_alconna,
     store_true,
 )
-from nonebot_plugin_session import EventSession
+from nonebot_plugin_alconna.uniseg.tools import reply_fetch
+from nonebot_plugin_uninfo import Uninfo
 
 from zhenxun.configs.config import BotConfig
 from zhenxun.configs.path_config import IMAGE_PATH
@@ -30,12 +33,14 @@ from zhenxun.utils.utils import get_user_avatar
 usage = """
 查看请求
 清空请求
-请求处理 -fa [id] / 同意好友请求 [id]      # 同意好友请求
-请求处理 -fr [id] / 拒绝好友请求 [id]      # 拒绝好友请求
-请求处理 -fi [id] / 忽略好友请求 [id]      # 忽略好友请求
-请求处理 -ga [id] / 同意群组请求 [id]      # 同意群聊请求
-请求处理 -gr [id] / 拒绝群组请求 [id]      # 拒绝群聊请求
-请求处理 -gi [id] / 忽略群组请求 [id]      # 忽略群聊请求
+同意请求 [id]
+拒绝请求 [id]
+忽略请求 [id]
+
+特别的，在引用消息时，可以不指定id
+/引用消息 同意请求
+/引用消息 拒绝请求
+/引用消息 忽略请求
 """.strip()
 
 
@@ -54,11 +59,11 @@ __plugin_meta__ = PluginMetadata(
 _req_matcher = on_alconna(
     Alconna(
         "请求处理",
-        Args["handle", ["-fa", "-fr", "-fi", "-ga", "-gr", "-gi"]]["id", int],
+        Args["handle", ["a", "r", "i"]]["id?", int],
         meta=CommandMeta(
-            description="好友/群组请求处理",
+            description="请求处理",
             usage=usage,
-            example="同意好友请求 20",
+            example="同意请求 20",
             compact=True,
         ),
     ),
@@ -105,12 +110,9 @@ _clear_matcher = on_alconna(
 )
 
 reg_arg_list = [
-    (r"同意好友请求", ["-fa", "{%0}"]),
-    (r"拒绝好友请求", ["-fr", "{%0}"]),
-    (r"忽略好友请求", ["-fi", "{%0}"]),
-    (r"同意群组请求", ["-ga", "{%0}"]),
-    (r"拒绝群组请求", ["-gr", "{%0}"]),
-    (r"忽略群组请求", ["-gi", "{%0}"]),
+    (r"同意请求\s*(?P<id>\d*)", ["a", "{id}"]),
+    (r"拒绝请求\s*(?P<id>\d*)", ["r", "{id}"]),
+    (r"忽略请求\s*(?P<id>\d*)", ["i", "{id}"]),
 ]
 
 for r in reg_arg_list:
@@ -125,34 +127,55 @@ for r in reg_arg_list:
 @_req_matcher.handle()
 async def _(
     bot: Bot,
-    session: EventSession,
+    event: Event,
+    session: Uninfo,
     handle: str,
-    id: int,
+    id: Match[int],
     arparma: Arparma,
 ):
+    reply: Reply | None = None
     type_dict = {
         "a": RequestHandleType.APPROVE,
         "r": RequestHandleType.REFUSED,
         "i": RequestHandleType.IGNORE,
     }
+    if not id.available:
+        reply = await reply_fetch(event, bot)
+        if not reply:
+            await MessageUtils.build_message("请引用消息处理或添加处理Id.").finish()
+    handle_id = id.result
+    if reply:
+        db_data = await FgRequest.get_or_none(message_ids__contains=reply.id)
+        if not db_data:
+            await MessageUtils.build_message(
+                "未发现此消息的Id，请使用Id进行处理..."
+            ).finish(reply_to=True)
+        handle_id = db_data.id
     req = None
-    handle_type = type_dict[handle[-1]]
+    handle_type = type_dict[handle]
     try:
         if handle_type == RequestHandleType.APPROVE:
-            req = await FgRequest.approve(bot, id)
+            req = await FgRequest.approve(bot, handle_id)
         if handle_type == RequestHandleType.REFUSED:
-            req = await FgRequest.refused(bot, id)
+            req = await FgRequest.refused(bot, handle_id)
         if handle_type == RequestHandleType.IGNORE:
-            req = await FgRequest.ignore(id)
+            req = await FgRequest.ignore(handle_id)
     except NotFoundError:
         await MessageUtils.build_message("未发现此id的请求...").finish(reply_to=True)
-    except Exception:
-        await MessageUtils.build_message("其他错误, 可能flag已失效...").finish(
+    except Exception as e:
+        logger.error(f"处理请求失败 ID: {handle_id}", session=session, e=e)
+        await MessageUtils.build_message(f"其他错误, 可能flag已失效...: {e}").finish(
             reply_to=True
         )
-    logger.info("处理请求", arparma.header_result, session=session)
+    logger.info(
+        f"处理请求 Id: {req.id if req else ''}", arparma.header_result, session=session
+    )
     await MessageUtils.build_message("成功处理请求!").send(reply_to=True)
-    if req and handle_type == RequestHandleType.APPROVE:
+    if (
+        req
+        and req.request_type == RequestType.GROUP
+        and handle_type == RequestHandleType.APPROVE
+    ):
         await bot.send_private_msg(
             user_id=req.user_id,
             message=f"管理员已同意此次群组邀请，请不要让{BotConfig.self_nickname}受委屈哦（狠狠监控）"
@@ -163,7 +186,7 @@ async def _(
 
 @_read_matcher.handle()
 async def _(
-    session: EventSession,
+    session: Uninfo,
     arparma: Arparma,
     is_friend: Query[bool] = AlconnaQuery("friend.value", False),
     is_group: Query[bool] = AlconnaQuery("group.value", False),
@@ -259,7 +282,7 @@ async def _(
 
 @_clear_matcher.handle()
 async def _(
-    session: EventSession,
+    session: Uninfo,
     arparma: Arparma,
     is_friend: Query[bool] = AlconnaQuery("friend.value", False),
     is_group: Query[bool] = AlconnaQuery("group.value", False),
