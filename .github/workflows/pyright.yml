@@ -11,9 +11,9 @@ on:
         type: choice
         options:
           - "all"
-          - "3.10"
           - "3.11"
           - "3.12"
+          - "3.13"
         default: "all"
       debug-mode:
         description: "enable debug mode"
